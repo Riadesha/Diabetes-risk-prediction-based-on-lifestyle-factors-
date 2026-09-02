@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(pdflatex --version)",
+      "Bash(claude update *)",
+      "Bash(claude --version)",
+      "Bash(npm install *)"
+    ]
+  }
+}

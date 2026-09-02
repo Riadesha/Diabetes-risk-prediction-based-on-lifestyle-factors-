@@ -1,0 +1,943 @@
+================================================================================
+ PROJECT ANALYSIS REPORT
+ Early-Stage Diabetes Risk Test  —  end-to-end review
+ Location : /home/mayesha-marzia-zaman/thesis_p
+ Date     : 2026-08-12
+================================================================================
+
+CONTENTS
+  1.  Executive summary
+  2.  Repository inventory
+  3.  Architecture overview
+  4.  Backend analysis (FastAPI)
+  5.  Model analysis (what is actually inside the .joblib)
+  6.  MAJOR FINDING — the label appears to be a deterministic rule
+  7.  Explainability (SHAP) analysis and its distortion
+  8.  Frontend analysis (React / Vite)
+  9.  Verification performed (live tests and results)
+  10. Defect list, ordered by severity
+  11. Reproducibility & thesis-readiness gaps
+  12. Security and deployment notes
+  13. Recommendations, prioritised
+  14. Note on the missing report/ directory
+
+
+================================================================================
+ 1. EXECUTIVE SUMMARY
+================================================================================
+
+This is a complete, working full-stack machine-learning web application. A React
+(Vite) single-page app collects ten health and lifestyle answers through a
+one-question-at-a-time wizard, posts them to a FastAPI backend, and renders a
+Low / Medium / High risk verdict together with a probability breakdown, a SHAP
+explanation chart, a live "what-if" simulator, and rule-based personalised
+recommendations. Everything runs. The backend loads, all four endpoints respond
+correctly, input validation works, and the frontend lints clean.
+
+The engineering is genuinely good for a thesis project: the code is small,
+readable, well commented, and consistently styled; the feature engineering in
+the API is explicitly written to mirror the training pipeline; the explainability
+layer is a real SHAP TreeExplainer rather than a mock; and the what-if simulator
+is a nice touch that most student projects do not have.
+
+The serious problem is not in the code — it is in the science. Probing the
+trained model shows its output is essentially a deterministic function of a
+simple additive risk score computed from the very same inputs. Confidence is
+~0.999 on 96% of probe points and exactly 1.000 on typical profiles. The claimed
+"~99% macro F1-score", advertised on the home page and in two knowledge-base
+articles, is therefore not evidence that the model learned anything clinically
+meaningful; it is what you get when a model reproduces the rule that generated
+its own labels. Section 6 documents this in detail. For a thesis, this needs to
+be either corrected (train on real clinical data) or stated openly as a
+limitation. It is the single highest-priority item in this report.
+
+A second, related issue: the engineered feature `risk_flag_count` absorbs the
+SHAP credit that belongs to its four constituent inputs (family history,
+hypertension, heart disease, high blood pressure). As a result the "Why this
+result?" chart systematically fails to mention those four clinically important
+factors even when they are the reason for the verdict, and the personalised
+recommendations that depend on them are always sorted to the bottom of the list.
+See section 7.
+
+Beyond that: there are no tests, no training code, and no dataset in the
+repository — the model is an opaque 1.7 MB binary that cannot currently be
+reproduced or audited. See section 11.
+
+
+================================================================================
+ 2. REPOSITORY INVENTORY
+================================================================================
+
+thesis_p/
+├── README.md                      project overview + run instructions (57 lines)
+├── run.txt                        long-form run guide + troubleshooting (139 lines)
+├── .gitignore                     ignores venv, __pycache__, node_modules, dist
+├── .claude/settings.local.json    tool permission allowlist (dev tooling only)
+├── backend/
+│   ├── main.py                    the entire backend, 355 lines
+│   ├── requirements.txt           8 pinned dependencies
+│   ├── venv/                      Python 3.12 virtual environment (present)
+│   ├── __pycache__/
+│   └── models/
+│       ├── diabetes_risk_model.joblib   1,770,810 bytes  (sklearn Pipeline)
+│       └── label_encoder.joblib             495 bytes    (LabelEncoder)
+└── frontend/
+    ├── package.json               React 19.2, react-router-dom 7.18, Vite 8.1
+    ├── vite.config.js             default config, React plugin only
+    ├── index.html                 SPA shell
+    ├── .oxlintrc.json             linter config
+    ├── public/                    favicon.svg, icons.svg
+    ├── dist/                      stale build output from 2026-08-10
+    └── src/
+        ├── main.jsx               (10)   React root, StrictMode
+        ├── App.jsx                (38)   router + ScrollToTop
+        ├── api.js                 (42)   fetch wrappers + risk colour metadata
+        ├── index.css              (40)   design tokens / resets
+        ├── App.css                (806)  all application styling, hand written
+        ├── components/
+        │   ├── Navbar.jsx         (49)
+        │   ├── Footer.jsx         (28)
+        │   ├── ExplanationBars.jsx(38)   diverging SHAP bar chart
+        │   ├── Recommendations.jsx(16)
+        │   └── WhatIfSimulator.jsx(104)  debounced live re-prediction
+        ├── pages/
+        │   ├── Home.jsx           (82)
+        │   ├── RiskTest.jsx       (247)  the wizard — largest component
+        │   ├── Knowledge.jsx      (29)
+        │   ├── Article.jsx        (75)
+        │   └── Faq.jsx            (39)
+        ├── data/
+        │   ├── questions.js       (104)  wizard question definitions
+        │   └── content.js         (169)  6 articles + 7 FAQs
+        └── assets/                hero.png, react.svg, vite.svg
+
+Total hand-written source: ~1,916 lines frontend + 355 lines backend ≈ 2,270 lines.
+
+NOT PRESENT (and expected for a thesis):
+  - the training notebook or script
+  - the dataset (the 5,000 records referenced in the knowledge article)
+  - any test suite (unit, integration, or model-evaluation)
+  - evaluation artefacts: confusion matrix, CV scores, classification report
+  - a LICENSE file
+  - the project is NOT under git version control (no .git directory), despite
+    a .gitignore file being present
+
+
+================================================================================
+ 3. ARCHITECTURE OVERVIEW
+================================================================================
+
+  Browser (React SPA, :5173)
+        |
+        |  POST /predict   {10 answers as JSON}
+        |  POST /explain   {same payload}
+        |  GET  /feature-importance
+        |  GET  /health
+        v
+  FastAPI (uvicorn, :8000)
+        |
+        |  build_features()  -> recreates bmi_category, age_group, risk_flag_count
+        v
+  sklearn imblearn Pipeline
+        prep  : ColumnTransformer (StandardScaler x3, OneHotEncoder x10) -> 31 cols
+        smote : SMOTE            (training only; bypassed at predict time)
+        clf   : XGBClassifier    (multi:softprob, 3 classes)
+        |
+        v
+  LabelEncoder -> ['High', 'Low', 'Medium']
+
+Request flow on submit: the frontend fires /predict and /explain concurrently
+via Promise.all. Both endpoints independently rebuild the feature frame and both
+run the model, so each submission costs two full inferences. Measured latency is
+7 ms and 13 ms respectively, so this is harmless in practice, but it is
+redundant work — /explain already computes everything /predict returns.
+
+The what-if simulator calls /predict again, debounced at 250 ms, on every
+control change.
+
+State is entirely client-side and ephemeral. There is no database, no session,
+no authentication, and no logging of user input — which correctly matches the
+privacy claim made on the home page and in the FAQ ("your answers are never
+stored"). That claim is accurate as implemented.
+
+
+================================================================================
+ 4. BACKEND ANALYSIS (backend/main.py, 355 lines)
+================================================================================
+
+STRUCTURE — the file is cleanly sectioned with banner comments:
+  (a) artefact loading at import time
+  (b) feature-label mapping and name-aggregation helpers
+  (c) Pydantic input schema with enums
+  (d) feature engineering
+  (e) SHAP contribution computation
+  (f) rule-based recommendation engine
+  (g) four routes
+
+WHAT IS DONE WELL
+
+  - Model, label encoder, SHAP explainer, and global feature importances are all
+    computed ONCE at import, not per request. This is the right call and is why
+    /predict returns in ~7 ms.
+
+  - Input validation is genuinely strict. Every categorical field is a str Enum,
+    so only exact training vocabulary is accepted; age is bounded [1,120] and
+    BMI [10,70] via Field constraints. Bad enum values and out-of-range numbers
+    both correctly return HTTP 422 (verified live, section 9). This closes off a
+    whole class of silent-garbage-in bugs.
+
+  - build_features() reproduces the three engineered features with the exact bin
+    edges — bmi_category on [0, 18.5, 25, 30, 100] and age_group on
+    [0, 30, 45, 60, 120] — and the comment above it correctly flags that this
+    MUST match the training notebook. This is the single most common source of
+    train/serve skew in student ML projects and it has been handled thoughtfully.
+
+  - _transformed_to_original() solves a real problem: mapping one-hot column
+    names like 'cat__bmi_category_Obese' back to the original feature. It sorts
+    the candidate names by descending length before prefix-matching, which is
+    what stops 'bmi_category_Obese' being mis-attributed to 'bmi' and
+    'age_group_Young' to 'age'. This is a subtle bug that was correctly avoided.
+    I verified the mapping is correct for all 31 transformed columns.
+
+  - The class-index lookup for SHAP is done by name
+    (`list(label_encoder.classes_).index("High")`) rather than by a hardcoded
+    integer. This matters because the encoder's alphabetical class order is
+    ['High','Low','Medium'] — "High" is index 0, not the 2 one might assume.
+    Hardcoding would have silently produced explanations for the wrong class.
+
+  - Probability-to-class alignment is correct. XGBoost's predict_proba columns
+    follow the encoded label order 0,1,2, which maps to
+    ['High','Low','Medium'] — the same array used to build the response dict.
+    Verified live: a healthy profile returns Low, an unhealthy one returns High.
+
+WEAKNESSES
+
+  - No exception handling anywhere. If a model artefact is missing or corrupt,
+    the process dies at import with a raw traceback. If SHAP raises inside
+    /explain, the client gets a bare 500 with no useful message. For a
+    demonstration app this is tolerable; for anything else it is not.
+
+  - No logging. There is no record of requests, latencies, or errors, which
+    makes any production issue undiagnosable.
+
+  - Hard-coded thresholds scattered in the code: the 0.005 SHAP cut-off, the
+    top-7 truncation, the BMI>=25 rule boundary. These would be better as named
+    module-level constants, both for readability and because a thesis should be
+    able to cite them.
+
+  - /predict and /explain duplicate their first four lines of work. /explain is
+    a strict superset of /predict; the frontend could call /explain alone and
+    have the same information in one round trip.
+
+  - The recommendation engine is a hand-written if-ladder of 8 rules. That is a
+    reasonable and defensible design — it is transparent and auditable, which is
+    arguably better than an ML-generated recommendation — but it should be
+    documented as rule-based in the thesis rather than implied to be part of the
+    "AI". The frontend heading "Your personalized plan" does slightly blur this.
+
+  - CORS is set to allow_origins=["*"]. The inline comment acknowledges this
+    ("tighten to your frontend URL in production"), so it is a known choice, but
+    it is worth stating explicitly in the thesis's limitations.
+
+
+================================================================================
+ 5. MODEL ANALYSIS
+================================================================================
+
+Introspected directly from the joblib artefact:
+
+  Pipeline type      : imblearn Pipeline
+  Steps              : ['prep', 'smote', 'clf']
+
+  prep  : ColumnTransformer
+            num -> StandardScaler   on ['age', 'bmi', 'risk_flag_count']
+            cat -> OneHotEncoder    on ['gender', 'physical_activity',
+                                        'smoking_habit', 'family_history',
+                                        'blood_pressure', 'food_habit',
+                                        'hypertension', 'heart_disease',
+                                        'bmi_category', 'age_group']
+            output dimensionality: 31 features
+
+  smote : SMOTE — sits inside the pipeline, so it is applied during fit only and
+          is correctly bypassed at predict time. Using imblearn's Pipeline rather
+          than sklearn's is the right choice here; it is what prevents the
+          resampling from leaking into cross-validation folds.
+
+  clf   : XGBClassifier
+            objective        = multi:softprob
+            n_estimators     = 300
+            max_depth        = 6
+            learning_rate    = 0.1
+            eval_metric      = mlogloss
+            random_state     = 42
+            subsample, colsample_bytree, reg_alpha, reg_lambda, gamma,
+            min_child_weight = all left at library defaults
+
+  LabelEncoder classes : ['High', 'Low', 'Medium']   (alphabetical, NOT ordinal)
+
+OBSERVATIONS
+
+  - 300 trees at depth 6 over 31 features for a 3-class problem on ~5,000 rows
+    is a large model for the task. No regularisation was tuned. There is no
+    evidence in the repository of a hyperparameter search. Given the finding in
+    section 6, the capacity is almost certainly far beyond what the problem
+    needs.
+
+  - The target is treated as nominal, not ordinal. Low < Medium < High is a
+    genuine ordering, and multi:softprob discards it. An ordinal formulation
+    would be more appropriate and is worth at least a sentence of justification
+    in the thesis.
+
+  - Loading the artefact emits an XGBoost warning that the model was pickled
+    rather than exported with Booster.save_model, and may not be portable across
+    XGBoost versions. This is a real reproducibility hazard: the pinned
+    xgboost==2.1.4 is currently the only version guaranteed to load this file.
+
+  - Global feature importance (aggregated back to original features, as the
+    /feature-importance endpoint returns):
+
+        Risk Flag Count      0.3208
+        BMI Category         0.2890
+        Physical Activity    0.1058
+        Age                  0.0914
+        BMI                  0.0779
+        Age Group            0.0344
+        Smoking Habit        0.0294
+        Food Habit           0.0266
+        Family History       0.0076
+        Hypertension         0.0062
+        Heart Disease        0.0056
+        Gender               0.0032
+        Blood Pressure       0.0021
+
+    Note the shape of this: the engineered composite `risk_flag_count` is the
+    single most important feature at 32%, while its four constituent inputs —
+    family history, hypertension, heart disease, blood pressure — together
+    account for only 2.2%. The model learned to read the summary and ignore the
+    parts. Note also that BMI Category (0.289, a coarse 4-bucket bin) dominates
+    raw BMI (0.078, the continuous value it was derived from), which is unusual
+    and again points to the label being defined in terms of the bins.
+
+    Endpoint caveat: /feature-importance exposes XGBoost's default gain-based
+    importance. This is a global, training-set property; it is not personalised
+    and should not be presented to a user as if it were.
+
+
+================================================================================
+ 6. MAJOR FINDING — THE LABEL APPEARS TO BE A DETERMINISTIC RULE
+================================================================================
+
+This is the most important finding in this report and it should be addressed
+before the thesis is submitted.
+
+WHAT WAS OBSERVED
+
+Step 1. Both of the example profiles in the project's own documentation return
+        a confidence of exactly 1.0000:
+
+          high-risk profile -> {"prediction":"High","confidence":1.0,
+                                "probabilities":{"High":1.0,"Low":0.0,"Medium":0.0}}
+          low-risk profile  -> {"prediction":"Low","confidence":1.0,
+                                "probabilities":{"High":0.0,"Low":1.0,"Medium":0.0}}
+
+        A model trained on real biological data does not do this. Real clinical
+        risk models produce graded, uncertain probabilities, because real people
+        with identical questionnaire answers have different outcomes.
+
+Step 2. A systematic sweep of 1,152 distinct input combinations (varying BMI,
+        activity, all four risk flags, blood pressure, and age) gave:
+
+          minimum confidence across all 1,152 probes : 0.9485
+          median confidence                          : 0.9996
+          mean confidence                            : 0.9982
+          fraction of probes with confidence > 0.99  : 96.0%
+
+        The model is near-certain essentially everywhere in the input space.
+        There is no meaningful decision boundary region.
+
+Step 3. A second sweep of 4,000 randomly sampled combinations across all ten
+        input fields was tested against a hypothesis: that the label is simply a
+        count of adverse conditions. Scoring each profile as
+
+          score = risk_flag_count
+                + 1 if BMI category is Obese
+                + 1 if physical activity is Low
+                + 1 if age >= 60
+                + 1 if food habit is Unhealthy
+                + 1 if smoking habit is Current
+
+        produced this relationship between score and predicted class:
+
+          score |  Low   Medium   High
+          ------+------------------------
+            0   |   46      0       0
+            1   |  195     65       0
+            2   |  169    504       0
+            3   |    0    964     107
+            4   |    0    518     500
+            5   |    0     16     581
+            6   |    0      0     260
+            7   |    0      0      65
+            8   |    0      0      10
+
+        The relationship is monotone and almost perfectly separating. Low occurs
+        only at scores 0-2, High only at scores 3+, and the two never co-occur at
+        any score. A crude, hand-guessed additive rule — with no fitting
+        whatsoever — reproduces the 300-tree XGBoost model's behaviour almost
+        exactly.
+
+WHAT THIS MEANS
+
+The target variable was almost certainly generated from the input features by a
+deterministic (or near-deterministic) formula, rather than observed from real
+patient outcomes. The dataset is synthetic. The model has not learned a
+relationship between lifestyle and diabetes; it has reverse-engineered the
+scoring rule that created its own labels.
+
+This fully and simply explains the "~99% macro F1-score" that the project
+advertises. That number is not a measure of clinical predictive skill. It is a
+measure of how well gradient boosting can recover an arithmetic rule — which is,
+unsurprisingly, almost perfectly. Cross-validation does not help here and does
+not rescue the number: every fold contains the same deterministic rule, so
+stable CV scores confirm only that the rule is consistent, not that it
+generalises to real patients.
+
+WHERE THE CLAIM CURRENTLY APPEARS (all of these need revision)
+
+  - frontend/src/pages/Home.jsx:13 — highlight card: "~99% F1-score on
+    validation data." Presented to the user as a headline accuracy claim.
+  - frontend/src/data/content.js:130 — "trained on 5,000 records of health and
+    lifestyle data."
+  - frontend/src/data/content.js:134 — "around 99% macro F1-score, and its
+    predictions were validated with cross-validation to confirm they are
+    stable."
+  - frontend/src/data/content.js:167 — FAQ: "roughly 99% macro F1-score,
+    confirmed with cross-validation."
+
+The existing disclaimers ("not a medical diagnosis", "consult a healthcare
+professional") are present and prominent, and they are good. But they address a
+different risk. A user reading "~99% accurate" will reasonably trust the number
+even while accepting it is not a diagnosis. The accuracy claim itself is the
+problem.
+
+WHAT TO DO — in order of preference
+
+  1. Best: obtain a real dataset with observed outcomes and retrain. Candidates
+     include the UCI Early Stage Diabetes Risk Prediction dataset (520 records,
+     genuine clinical symptoms), the Pima Indians Diabetes dataset, or the CDC
+     BRFSS diabetes indicators. Expect accuracy to fall to a realistic 75-85%.
+     A defensible 80% on real data is worth far more in a thesis than 99% on a
+     rule.
+
+  2. If the synthetic dataset must be kept: say so explicitly and prominently.
+     State in the thesis that the data is synthetic and rule-generated, report
+     the 99% as an upper bound that reflects rule recovery rather than clinical
+     validity, and demonstrate the point — a simple logistic regression or even
+     the hand-written score above will score nearly as well, which is itself a
+     publishable observation about the dataset. Remove the "~99% F1-score" claim
+     from the user-facing UI, or rephrase it as "reproduces its training rule
+     with ~99% F1 on synthetic data."
+
+  3. Either way: run and report a proper evaluation — confusion matrix,
+     per-class precision/recall, and a comparison against a trivial baseline.
+     The absence of a baseline comparison is what allowed the 99% to look
+     impressive.
+
+
+================================================================================
+ 7. EXPLAINABILITY (SHAP) ANALYSIS AND ITS DISTORTION
+================================================================================
+
+HOW IT WORKS
+
+A shap.TreeExplainer is built once over the XGBoost step. Per request, the input
+frame is passed through the preprocessor, SHAP values are computed for the 31
+transformed columns, the column corresponding to the "High" class is selected,
+and the per-column values are summed back to the 13 original features by
+aggregate_by_original(). Features with |contribution| < 0.005 are dropped and the
+top 7 by absolute magnitude are returned, each tagged "increase" or "decrease".
+The frontend renders these as a diverging bar chart centred on zero, red to the
+right for risk-raising and green to the left for risk-lowering.
+
+This is a correct and well-executed implementation. Summing SHAP values across
+one-hot columns of the same original feature is the right aggregation (SHAP
+values are additive in log-odds space, so they sum legitimately). Selecting the
+class index by name rather than position is correct. Building the explainer once
+rather than per request is correct.
+
+THE DISTORTION
+
+Because `risk_flag_count` is a composite of four other inputs and the model
+leans on it heavily, that one feature absorbs nearly all the attribution that
+belongs to its parts. The consequence is visible in a live request. For the
+profile: male, 55, BMI 31.5, low activity, current smoker, family history YES,
+blood pressure HIGH, unhealthy diet, hypertension YES, no heart disease — the
+returned explanation is:
+
+    Risk Flag Count      +2.8655   increase
+    Physical Activity    +1.3494   increase
+    BMI                  +1.2689   increase
+    Age                  +1.1710   increase
+    Smoking Habit        +0.4913   increase
+    Food Habit           +0.4045   increase
+    Hypertension         +0.1741   increase
+
+Family History does not appear. Blood Pressure does not appear. Both are set to
+their highest-risk values in this profile, and both are genuine clinical risk
+factors, and neither is shown to the user. Hypertension barely scrapes in at
+0.17, roughly 6% of the weight given to the composite that contains it.
+
+Meanwhile "Risk Flag Count" — the top row, the largest bar, the thing the user
+is told matters most — is an internal engineering artefact. It is not a phrase
+any patient or clinician would recognise, and it is not actionable. The single
+most prominent element of the explanation is the least interpretable one.
+
+KNOCK-ON EFFECT ON RECOMMENDATIONS
+
+generate_recommendations() sorts the triggered rules by their features' SHAP
+contribution. Because family_history, hypertension, heart_disease, and
+blood_pressure all have near-zero attribution, the four recommendations keyed to
+them — "Screen regularly", "Keep hypertension controlled", "Prioritise heart
+health", "Manage your blood pressure" — are structurally guaranteed to sort to
+the bottom of the list, regardless of how clinically important they are for that
+particular user. In the live example above, the user has both a family history
+and diagnosed hypertension, and both of those recommendations rank below diet
+advice.
+
+REMEDIES
+
+  a) Simplest and recommended: drop `risk_flag_count` from the model entirely.
+     It is a linear combination of four features the model already has, so it
+     adds no information — it only concentrates attribution. Retrain without it
+     and the four clinical flags will receive their own honest SHAP values.
+     Expect little to no loss in accuracy.
+
+  b) If it is kept for accuracy reasons: redistribute its SHAP contribution back
+     across the four constituent flags before returning the explanation, in
+     proportion to which flags are actually set for that user.
+
+  c) Minimum viable fix: at least rename "Risk Flag Count" to something a human
+     understands — "Combined medical risk factors" — and list which flags are
+     active. Also consider suppressing engineered features (age_group,
+     bmi_category) from the user-facing chart, since they duplicate Age and BMI
+     which are already shown, and a user seeing both "BMI" and "BMI Category" as
+     separate bars will reasonably be confused.
+
+  d) Sort recommendations by a clinical priority weight rather than by SHAP
+     value, or by a blend of the two.
+
+
+================================================================================
+ 8. FRONTEND ANALYSIS (React 19 + Vite 8, ~1,916 lines)
+================================================================================
+
+STACK: React 19.2, react-router-dom 7.18, Vite 8.1, oxlint. No UI framework, no
+state-management library, no chart library — all styling is hand-written CSS
+(806 lines in App.css) and all charts are hand-built divs. For a project of this
+size that is a sound decision: zero dependency surface, full control, fast build.
+
+ROUTING (App.jsx): five routes — /, /test, /knowledge, /knowledge/:id, /faq —
+with a catch-all that renders Home. A ScrollToTop component resets scroll on
+navigation, which is a small detail that many projects miss.
+
+RiskTest.jsx (247 lines) is the core. It runs a four-phase state machine
+(intro → quiz → loading → result) over ten questions defined declaratively in
+data/questions.js. Three input types are supported: choice, boolean, and slider.
+Choice and boolean auto-advance after a 180 ms delay, which feels responsive;
+sliders require an explicit Next because auto-advancing on a drag would be
+wrong. Progress bar, back navigation, and error display are all handled.
+
+WhatIfSimulator.jsx (104 lines) is the standout feature. It exposes only the
+five modifiable factors (activity, diet, smoking, blood pressure, BMI —
+correctly excluding age, gender, and family history, which cannot be changed),
+re-predicts on a 250 ms debounce, and reports the delta as "Improved from
+High → Medium" using an explicit rank map. The debounce and the cleanup on
+unmount are both correct. This is a good piece of interaction design and is
+worth highlighting in the thesis.
+
+ExplanationBars.jsx normalises each contribution against the maximum absolute
+value in the set and renders a centred diverging bar. Correct and compact.
+
+CONTENT: six knowledge articles and seven FAQs, stored as structured JS objects
+with a small block renderer (p / h / ul / callout) in Article.jsx. The medical
+content itself is accurate and appropriately hedged — the type descriptions,
+BMI ranges, the 150 minutes/week activity guidance, and the 5-7% weight-loss
+figure are all consistent with standard public health guidance. The exception is
+the accuracy claims discussed in section 6.
+
+ISSUES FOUND
+
+  - CRITICAL FOR DEPLOYMENT: api.js:1 hard-codes
+    `export const API_URL = 'http://127.0.0.1:8000'`. The built app can only
+    ever talk to a backend on the user's own machine. The dist/ bundle already
+    contains this literal. Should be `import.meta.env.VITE_API_URL` with a
+    localhost fallback and a .env.example file.
+
+  - Error handling is string-sniffing. RiskTest.jsx:39 branches on
+    `String(err).includes('fetch') || String(err).includes('Failed')` to decide
+    whether to show "Cannot reach the backend." This is brittle and
+    locale/browser dependent — it depends on the exact wording of the browser's
+    network error message. Catching TypeError explicitly, or having the api.js
+    wrappers throw a typed error, would be robust.
+
+  - 422 validation errors are shown as a bare "Server error (422)". FastAPI
+    returns a detailed JSON body explaining exactly which field failed, and it
+    is discarded. Users would see an opaque number.
+
+  - Type inconsistency on slider values. INITIAL_ANSWERS sets bmi: 25 and
+    age: 45 as numbers, but the range input's onChange stores e.target.value as
+    a string. The API layer coerces with Number() so predictions are unaffected,
+    but WhatIfSimulator.jsx:44 detects change via
+    `JSON.stringify(sim) !== JSON.stringify(baseAnswers)` — so moving the BMI
+    slider and returning it to its original position leaves 25 as "25" and the
+    UI keeps claiming the profile has changed and keeps showing the Reset
+    button. Minor but visible. Fix by storing Number(e.target.value).
+
+  - WhatIfSimulator swallows all errors (`catch {}` with a comment "keep last
+    result on error"). If the backend goes down mid-session, the simulator
+    silently keeps showing stale results while the user moves controls and
+    believes they are seeing live predictions. It should surface a stale-data
+    indicator.
+
+  - Two /predict + /explain calls fire in parallel per submission where one
+    /explain call would suffice.
+
+  - Accessibility gaps: the diverging SHAP chart conveys direction by colour
+    (red/green) plus a bare "+"/"−" glyph, with no text alternative and no ARIA
+    labelling — this is the exact red/green pairing that is hardest for the most
+    common form of colour blindness. The progress bar has no role="progressbar"
+    or aria-valuenow. The choice buttons are not grouped as a radiogroup. The
+    FAQ accordion toggles without aria-expanded. None of these are hard to fix
+    and an accessibility paragraph would strengthen the thesis.
+
+  - The FAQ accordion animates via a hardcoded `maxHeight: '300px'`. Any answer
+    exceeding 300px would be clipped. Current answers all fit, so this is latent
+    rather than active.
+
+  - Several React list keys use array index (`key={i}`) in Recommendations.jsx,
+    Article.jsx, and Faq.jsx. Harmless here since the lists are static and never
+    reordered, but worth noting as a habit.
+
+  - index.html declares no favicon link even though public/favicon.svg exists.
+    In fact none of the five assets in public/ and src/assets/ (favicon.svg,
+    icons.svg, hero.png, react.svg, vite.svg) are referenced anywhere in the
+    source. They are dead weight in the repository.
+
+  - frontend/dist/ contains a stale build from 2026-08-10 that predates the
+    current source. It is gitignored, so this only matters if someone serves it
+    by mistake — but it should be deleted to avoid confusion.
+
+  - No <meta name="description">, no Open Graph tags, no lang-specific SEO. Not
+    important for a thesis demo, worth one line if the tool is to be published.
+
+LINTING: `npm run lint` (oxlint) passes with zero warnings and zero errors.
+There is one inline eslint-disable for react-hooks/exhaustive-deps in
+WhatIfSimulator.jsx:35, which is a legitimate and correctly-scoped use.
+
+
+================================================================================
+ 9. VERIFICATION PERFORMED
+================================================================================
+
+All of the following were executed live against the real code during this
+analysis. A backend instance was started on port 8021 to avoid disturbing
+anything on the default port, and was shut down afterwards.
+
+  [PASS] Backend imports and starts cleanly; both joblib artefacts load.
+         (One non-fatal XGBoost serialisation warning — see section 5.)
+
+  [PASS] GET /health
+         -> {"status":"ok","classes":["High","Low","Medium"]}
+
+  [PASS] GET /feature-importance
+         -> 13 features, correctly aggregated and ranked (table in section 5).
+
+  [PASS] POST /predict, documented high-risk profile
+         -> {"prediction":"High","confidence":1.0,
+             "probabilities":{"High":1.0,"Low":0.0,"Medium":0.0}}
+
+  [PASS] POST /predict, healthy profile
+         -> {"prediction":"Low","confidence":1.0,
+             "probabilities":{"High":0.0,"Low":1.0,"Medium":0.0}}
+         Directionally correct — but see section 6 on the 1.0 confidences.
+
+  [PASS] POST /explain -> 7 contributions + 4 ordered recommendations,
+         well-formed. Content concerns documented in section 7.
+
+  [PASS] Boundary input: age=120, bmi=70 (the schema maxima) -> 200 OK, "High".
+         Confirms the pd.cut bin edges do not produce NaN at the extremes.
+
+  [PASS] Invalid enum value (gender="Other") -> HTTP 422.
+
+  [PASS] Out-of-range numeric (age=0) -> HTTP 422.
+
+  [PASS] Latency: /predict 7.2 ms, /explain 13.2 ms (localhost, warm).
+
+  [PASS] Frontend lint: `npm run lint` -> clean, 0 issues.
+
+  [PASS] frontend/node_modules present; backend/venv present. Both parts of the
+         app are runnable as documented in run.txt without further setup.
+
+  [INFO] Model decision-surface probes: 1,152-point structured sweep and a
+         4,000-point random sweep. Results in section 6.
+
+  [N/A ] No test suite exists to run.
+  [N/A ] No training code exists to re-execute or verify against.
+
+
+================================================================================
+ 10. DEFECT LIST, ORDERED BY SEVERITY
+================================================================================
+
+ #  Sev       Location                        Issue
+ --------------------------------------------------------------------------
+ 1  CRITICAL  model + Home.jsx:13,            Label is a deterministic function
+              content.js:130,134,167          of the inputs; the "~99% F1"
+                                              claim does not mean what the UI
+                                              says it means. See section 6.
+
+ 2  HIGH      main.py (risk_flag_count),      Composite feature absorbs SHAP
+              main.py:208-214, 281-293        credit from family history,
+                                              hypertension, heart disease and
+                                              blood pressure. Those factors are
+                                              invisible in the explanation and
+                                              their recommendations always rank
+                                              last. See section 7.
+
+ 3  HIGH      repository-wide                 No training code, no dataset, no
+                                              evaluation artefacts. The model
+                                              cannot be reproduced or audited.
+
+ 4  HIGH      repository-wide                 No tests of any kind.
+
+ 5  HIGH      api.js:1                        API_URL hard-coded to
+                                              127.0.0.1:8000; the app cannot be
+                                              deployed anywhere.
+
+ 6  MEDIUM    repository-wide                 Not under git version control,
+                                              despite having a .gitignore.
+
+ 7  MEDIUM    main.py (throughout)            No error handling, no logging.
+
+ 8  MEDIUM    RiskTest.jsx:39                 Error classification by substring
+                                              match on the exception text.
+
+ 9  MEDIUM    api.js:13,27,33                 FastAPI 422 detail bodies are
+                                              discarded; user sees only a code.
+
+10  MEDIUM    main.py — model artefact        Pickled rather than exported via
+                                              Booster.save_model; only loadable
+                                              on xgboost 2.1.4.
+
+11  MEDIUM    ExplanationBars.jsx,            Colour-only encoding (red/green),
+              RiskTest.jsx:170-174, Faq.jsx   missing ARIA on progress bar,
+                                              choice groups, and accordion.
+
+12  LOW       WhatIfSimulator.jsx:44          String/number mismatch makes the
+                                              "changed" indicator sticky after
+                                              a slider returns to its origin.
+
+13  LOW       WhatIfSimulator.jsx:28-30       Silent catch hides backend
+                                              failures; stale results shown as
+                                              if live.
+
+14  LOW       RiskTest.jsx:29-32              /predict and /explain both called
+                                              when /explain alone suffices.
+
+15  LOW       Faq.jsx:31                      Hardcoded maxHeight 300px will
+                                              clip any longer future answer.
+
+16  LOW       main.py:345, 344, 224           Magic numbers (top-7, 0.005 SHAP
+                                              floor, BMI 25) should be named
+                                              constants.
+
+17  LOW       public/, src/assets/            Five asset files, none referenced.
+
+18  LOW       frontend/dist/                  Stale build output from 2026-08-10.
+
+19  LOW       index.html                      No favicon link, no meta
+                                              description.
+
+20  INFO      model                           Ordinal target modelled as
+                                              nominal; no hyperparameter search.
+
+
+================================================================================
+ 11. REPRODUCIBILITY & THESIS-READINESS GAPS
+================================================================================
+
+For a defensible thesis, these are the missing pieces, independent of the
+findings above:
+
+  MISSING — training code. The notebook referenced in main.py's comments ("MUST
+  match the training notebook exactly") is not in the repository. Without it,
+  no examiner can verify that build_features() actually does match training, and
+  the whole train/serve consistency argument rests on trust. This is the most
+  important artefact to recover and commit.
+
+  MISSING — the dataset. The "5,000 records" cannot be inspected. Its
+  provenance, collection method, class balance, and — critically — whether it is
+  synthetic and how it was generated, are all undocumented. Section 6 strongly
+  suggests it is rule-generated; the generation script itself would settle the
+  question immediately.
+
+  MISSING — evaluation. No confusion matrix, no per-class precision/recall, no
+  ROC/PR curves, no cross-validation output, no learning curves. The single
+  headline number "99% macro F1" is asserted in the UI text with nothing behind
+  it in the repository.
+
+  MISSING — baseline comparison. There is no comparison against logistic
+  regression, a decision tree, or a trivial majority-class predictor. This is
+  the standard way to demonstrate that a complex model earned its complexity,
+  and in this project it would have immediately exposed the finding in section 6
+  — a rule-based dataset means a simple model scores nearly as well as XGBoost.
+
+  MISSING — class balance figures. SMOTE is in the pipeline, which implies
+  imbalance, but the actual pre- and post-resampling class distributions are not
+  recorded anywhere.
+
+  MISSING — version control. No git history means no record of how the work
+  developed, which is itself often expected evidence for a thesis.
+
+  MISSING — a stated ethical / clinical-safety position. The app gives health
+  guidance to the public. The disclaimers are good but informal. A short section
+  on intended use, out-of-scope use, failure modes, and what happens when the
+  model is wrong would considerably strengthen the writeup — and is genuinely
+  expected of any health-ML work.
+
+
+================================================================================
+ 12. SECURITY AND DEPLOYMENT NOTES
+================================================================================
+
+The application handles sensitive health information, so this deserves comment
+even though the current deployment is local-only.
+
+  GOOD — No persistence of any kind. Nothing is written to disk or database, so
+  the "your answers are never stored" claim on the home page and in the FAQ is
+  accurate as implemented. This is genuinely the right design for this tool and
+  should be stated as a deliberate privacy decision in the thesis.
+
+  GOOD — No logging of request bodies, so health data does not leak into log
+  files.
+
+  GOOD — Strict input validation via Pydantic enums and bounded numerics closes
+  off malformed-input handling entirely.
+
+  CONCERN — CORS allow_origins=["*"]. Acknowledged in a code comment as a
+  development setting. Must be restricted before any public deployment.
+
+  CONCERN — No rate limiting. The /explain endpoint runs SHAP per request, and
+  the what-if simulator is designed to call the API repeatedly. Trivially
+  abusable as a CPU-exhaustion vector if exposed publicly.
+
+  CONCERN — No HTTPS configuration or guidance. Health questionnaire answers
+  would travel in plaintext over any non-local network.
+
+  CONCERN — joblib.load() executes arbitrary pickle code. This is safe here
+  because the artefacts are local and self-produced, but it means the model
+  files must be treated as trusted code, never fetched from an untrusted source.
+
+  CONCERN — No authentication, no CSRF protection. Acceptable for an anonymous
+  stateless calculator with no persistence; would not be if any account or
+  history feature were added.
+
+  NOTE — .claude/settings.local.json contains only a development tool
+  permission allowlist. No credentials, tokens, or secrets were found anywhere
+  in the repository.
+
+
+================================================================================
+ 13. RECOMMENDATIONS, PRIORITISED
+================================================================================
+
+DO FIRST — these affect the validity of the thesis itself
+
+  1. Resolve the label-leakage question (section 6). Locate the dataset and the
+     script that produced it. If the labels were computed from the features,
+     either retrain on real data or document the synthetic nature explicitly and
+     reframe the 99% as rule recovery rather than clinical accuracy.
+
+  2. Remove or rewrite the "~99% F1-score" claims in Home.jsx:13 and
+     content.js:130,134,167 to match whatever section 6 resolves to.
+
+  3. Recover and commit the training notebook and the dataset. Put the whole
+     project under git.
+
+  4. Produce a real evaluation: confusion matrix, per-class precision/recall,
+     cross-validation scores with variance, and a comparison against logistic
+     regression and a majority-class baseline.
+
+DO NEXT — these materially improve the system
+
+  5. Drop `risk_flag_count` from the model and retrain (section 7a). Verify the
+     accuracy cost is negligible, then confirm that family history,
+     hypertension, heart disease, and blood pressure now receive their own SHAP
+     attribution.
+
+  6. If it must stay, at minimum rename it in FEATURE_LABELS to "Combined
+     medical risk factors" and suppress age_group / bmi_category from the
+     user-facing chart to avoid double-counting with Age and BMI.
+
+  7. Add a test suite. Minimum useful set: (a) build_features() produces the
+     expected bins at the boundaries 18.5/25/30 and 30/45/60; (b) each endpoint
+     returns the expected shape; (c) invalid input returns 422; (d) probability
+     dict keys align with label_encoder.classes_; (e) a golden-file test pinning
+     predictions for a handful of fixed profiles, so retraining cannot silently
+     change behaviour.
+
+  8. Move API_URL to import.meta.env.VITE_API_URL with a localhost default, and
+     add frontend/.env.example.
+
+  9. Add try/except and structured logging to the backend routes.
+
+ 10. Re-export the model with Booster.save_model so it is not tied to a single
+     XGBoost version.
+
+DO IF TIME ALLOWS — polish
+
+ 11. Surface FastAPI's 422 detail text in the UI instead of a bare status code.
+ 12. Fix the string/number slider inconsistency in WhatIfSimulator.
+ 13. Show a stale-data indicator when the simulator's fetch fails.
+ 14. Collapse the double /predict + /explain call into one /explain call.
+ 15. Accessibility pass: ARIA on the progress bar, choice groups, and accordion;
+     add a non-colour cue (text or pattern) to the SHAP bars.
+ 16. Delete the unreferenced assets and the stale dist/ directory.
+ 17. Extract the magic numbers in main.py into named constants.
+ 18. Add a LICENSE file and a short ethics/intended-use statement.
+
+
+================================================================================
+ 14. NOTE ON THE MISSING report/ DIRECTORY
+================================================================================
+
+When this analysis began, the project root contained a `report/` directory dated
+2026-08-10 23:52, holding four LaTeX files: main.tex, Introduction.tex,
+"Literature Review.tex", and Methodology.tex. A few minutes later, partway
+through the analysis, that directory was no longer present, and the project
+root's modification time had changed accordingly.
+
+Nothing in this analysis removed it — only read-only commands (ls, find, cat,
+wc, curl, lint, and read-only Python model introspection) were run, and no
+delete, move, or write operation touched the project until this report file was
+created. The most likely explanation is that the directory was moved or deleted
+from outside this session while the analysis was running.
+
+Two consequences worth flagging:
+
+  - The LaTeX thesis text was never read, so this report covers the code, the
+    model, and the data pipeline only. The written thesis chapters are not
+    assessed here.
+
+  - Because the project is not under version control, if that deletion was
+    accidental there is no way to recover those files from the repository.
+    Checking a backup, the trash, or the editor's local history would be
+    worthwhile, and it is worth doing soon.
+
+This is also the strongest practical argument for recommendation #3: `git init`
+and an initial commit would have made this a non-event.
+
+
+================================================================================
+ END OF REPORT
+================================================================================
